@@ -1,5 +1,5 @@
 <div id="settings_plugin_filamentmotionsensor">
-    <h4>{{ _('Filament Motion Sensor') }}</h4>
+    <h4>{{ _('Filament Motion Sensor USB (MCP2221A)') }}</h4>
     <form class="form-horizontal">
     <!-- General -->
 
@@ -17,18 +17,72 @@
         </div>
 
 
-        <!-- GPIO pin on the raspberry -->
+        <!-- MCP2221A GPIO pin -->
         <div class="control-group">
-            <label class="control-label">{{ _('Motion Sensor GPIO Pin:') }}</label>
-            <div class="controls" data-toggle="tooltip" title="{{ _('Which Raspberry Pi GPIO pin your switch is attached to (-1 disables the plugin)') }}">
-                <input type="text" step="any" min="0" class="input-mini text-right" data-bind="enable: enableCriticalSettings, value: settingsViewModel.settings.plugins.filamentmotionsensor.motion_sensor_pin"> 
+            <label class="control-label">{{ _('Motion Sensor MCP2221A Pin:') }}</label>
+            <div class="controls" data-toggle="tooltip" title="{{ _('Which MCP2221A GP pin the motion signal is attached to (-1 disables motion detection)') }}">
+                <select class="select-mini" data-bind="enable: enableCriticalSettings, value: settingsViewModel.settings.plugins.filamentmotionsensor.motion_sensor_pin">
+                    <option value="-1">{{ _('Disabled') }}</option>
+                    <option value="0">G0</option>
+                    <option value="1">G1</option>
+                    <option value="2">G2</option>
+                    <option value="3">G3</option>
+                </select>
             </div>
-            
-            <span class="help-block"><small>Refer to <a href="https://pinout.xyz/ ">pinout.xyz</a> for pinout. Use the BCM number after GPIO-?. e.g. GPIO 21 is the last pin. Prefer 17.</small></span>
+
+            <span class="help-block"><small>MCP2221A GP pin (G0&ndash;G3) wired to the sensor's <b>motion</b> signal (toggles while filament moves). On a BTT SFS V2.0 this is the <b>green</b> wire. The MCP2221A is read over USB via Adafruit Blinka.</small></span>
             <button class="btn btn-primary span4" data-bind="enable: enableCriticalSettings, click: function() { showConnectionTest(); }" title="{{ _('Start sensor connection test')|edq }}">Test sensor</button>
-            
+
         </div>
 
+
+        <h6>{{ _('Runout Switch Sensor') }}</h6>
+
+        <!-- Enable / Disable runout switch -->
+        <div class="control-group">
+            <div class="controls" data-toggle="tooltip" title="{{ _('Enable a separate filament-runout switch (e.g. BTT SFS V2.0 switch signal).') }}">
+                <label class="checkbox">
+                    <input type="checkbox" data-bind="enable: enableCriticalSettings, checked: settingsViewModel.settings.plugins.filamentmotionsensor.runout_sensor_enabled"> {{ _('Enable Runout Switch') }}
+                </label>
+            </div>
+        </div>
+
+        <!-- Runout switch pin -->
+        <div class="control-group">
+            <label class="control-label">{{ _('Runout Switch MCP2221A Pin:') }}</label>
+            <div class="controls" data-toggle="tooltip" title="{{ _('Which MCP2221A GP pin the runout switch signal is attached to (-1 disables it)') }}">
+                <select class="select-mini" data-bind="enable: enableCriticalSettings, value: settingsViewModel.settings.plugins.filamentmotionsensor.runout_sensor_pin">
+                    <option value="-1">{{ _('Disabled') }}</option>
+                    <option value="0">G0</option>
+                    <option value="1">G1</option>
+                    <option value="2">G2</option>
+                    <option value="3">G3</option>
+                </select>
+            </div>
+            <span class="help-block"><small>MCP2221A GP pin (G0&ndash;G3) wired to the <b>switch</b> signal (filament present / absent). On a BTT SFS V2.0 this is the <b>blue</b> wire. Must differ from the motion pin.</small></span>
+        </div>
+
+        <!-- Runout polarity -->
+        <div class="control-group">
+            <div class="controls" data-toggle="tooltip" title="{{ _('Which logic level means the filament has run out.') }}">
+                <label class="checkbox">
+                    <input type="checkbox" data-bind="checked: settingsViewModel.settings.plugins.filamentmotionsensor.runout_triggered_low"> {{ _('No filament when signal is LOW (0)') }}
+                </label>
+            </div>
+            <span class="help-block"><small>Per the BTT SFS V2.0 manual the switch output is <b>LOW when there is no filament</b>, so keep this checked. Uncheck only if your wiring is inverted (no filament = HIGH).</small></span>
+        </div>
+
+        <!-- Runout debounce -->
+        <div class="control-group">
+            <label class="control-label">{{ _('Runout debounce:') }}</label>
+            <div class="controls">
+                <div class="input-append" data-toggle="tooltip" title="{{ _('How long the no-filament level must persist before pausing.') }}">
+                    <input type="number" step="any" min="0" class="input-mini text-right" data-bind="value: settingsViewModel.settings.plugins.filamentmotionsensor.runout_debounce">
+                    <span class="add-on">sec</span>
+                </div>
+                <span class="help-block"><small>Time the switch must read "no filament" before the print is paused. Avoids false triggers from contact chatter. ~0.2 s is a good default.</small></span>
+            </div>
+        </div>
 
 
         <h6>{{ _('Action commands') }}</h6>

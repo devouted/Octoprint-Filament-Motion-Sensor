@@ -2,13 +2,13 @@
 from __future__ import absolute_import
 import octoprint.plugin
 from octoprint.events import Events
-#import RPi.GPIO as GPIO
-#import gpiod
 #from datetime import datetime
 import time
 import flask
-from .SensorGPIOThread import MotionSensorGPIOThread
-from .SensorGPIOThread import plugin_check_rpi_gpio
+from .SensorUSBThread import MotionSensorUSBThread
+from .SensorUSBThread import RunoutSensorUSBThread
+from .SensorUSBThread import CombinedSensorUSBThread
+from .SensorUSBThread import plugin_check_mcp2221
 from .data import FilamentMotionSensorDetectionData
 import os.path
 _debug_in_terminal = False # send debug messages in Gcode terminal
@@ -58,12 +58,48 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
         self.t0_temp = -255
         self.last_temp_time = 0
         self.hook_it = True
+        self.runout_sensor_thread = None
+        self.sensor_thread = None
+        self.runout_paused = False
         
         self._data = FilamentMotionSensorDetectionData(self.motion_sensor_detection_distance, True, self.updateToUi)
 #Properties
     @property
     def motion_sensor_pin(self):
-        return int(self._settings.get(["motion_sensor_pin"]))
+        # Stored as the MCP2221A GP number (0..3), or -1 to disable.
+        # Kept as an int so the existing ">= 0" guards throughout the plugin
+        # continue to work unchanged. The USB sensor thread maps the number
+        # to the Blinka board pin name (0 -> "G0", 1 -> "G1", ...).
+        try:
+            return int(self._settings.get(["motion_sensor_pin"]))
+        except (TypeError, ValueError):
+            return -1
+
+    # --- Runout switch sensor properties -------------------------------------
+    @property
+    def runout_sensor_enabled(self):
+        return self._settings.get_boolean(["runout_sensor_enabled"])
+
+    @property
+    def runout_sensor_pin(self):
+        # MCP2221A GP number (0..3) for the runout switch, or -1 to disable.
+        try:
+            return int(self._settings.get(["runout_sensor_pin"]))
+        except (TypeError, ValueError):
+            return -1
+
+    @property
+    def runout_triggered_low(self):
+        # True  -> filament ABSENT when the pin reads LOW  (BTT SFS V2.0 default)
+        # False -> filament ABSENT when the pin reads HIGH (inverted wiring)
+        return self._settings.get_boolean(["runout_triggered_low"])
+
+    @property
+    def runout_debounce(self):
+        try:
+            return float(self._settings.get(["runout_debounce"]))
+        except (TypeError, ValueError):
+            return 0.2
 
     @property
     def motion_sensor_pause_print(self):
@@ -121,13 +157,29 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
 # Initialization methods
     def _setup_sensor(self):
         
-        self._logger.info("Using BCM Mode ONLY")
+        self._logger.info("Using MCP2221A over USB (Adafruit Blinka)")
         
         if self.motion_sensor_enabled == False:
             self._logger.info("Motion sensor is deactivated")
 
         self._data.filament_moving = False
         self.motion_sensor_thread = None
+
+        # Stop the combined sensor thread so it picks up the (possibly) changed
+        # pin / polarity / debounce settings.
+        self.sensor_thread_stop()
+        self.runout_paused = False
+
+        # If a print is currently running, re-arm the sensor immediately with
+        # the new settings so changes take effect "on the fly" without having
+        # to stop the print. (If the print is paused, the PRINT_RESUMED handler
+        # restarts it; if idle, it starts on the next PRINT_STARTED.)
+        try:
+            if self._printer is not None and self._printer.is_printing():
+                self.sensor_thread_start()
+                self._logger.info("Settings changed mid-print: sensor re-armed with new settings.")
+        except Exception as ex:
+            self._logger.debug("Could not check printing state on settings save: %s" % ex)
 
         self.load_filament_sensor_data()
 
@@ -144,8 +196,14 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
             #Motion sensor
             mode=0,    # Board Mode
             motion_sensor_enabled = True, #Sensor detection is enabled by default
-            motion_sensor_pin=-1,  # Default is no pin
+            motion_sensor_pin=0,  # Default MCP2221A pin G0 for motion (green wire)
             detection_method = 0, # 0 = timeout detection, 1 = distance detection
+
+            # Runout switch sensor (e.g. BTT SFS V2.0 switch signal, blue wire)
+            runout_sensor_enabled = False,  # off by default for backward compatibility
+            runout_sensor_pin = 1,          # Default MCP2221A pin G1 for runout switch
+            runout_triggered_low = True,    # BTT SFS V2.0: LOW = no filament
+            runout_debounce = 0.2,          # seconds the 'absent' level must persist
 
             # Distance detection
             motion_sensor_detection_distance = 7, # Recommended detection distance from Marlin would be 7
@@ -195,7 +253,7 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
         except: self.motion_sensor_thread  = None
         
         if(self.motion_sensor_thread is None):
-            self.motion_sensor_thread = MotionSensorGPIOThread(1, "ConnectionTest", self.motion_sensor_pin,
+            self.motion_sensor_thread = MotionSensorUSBThread(1, "ConnectionTest", self.motion_sensor_pin,
                 CONNECTION_TEST_TIME, self._logger, self._data, pCallback=self.connectionTestCallback)
             self.motion_sensor_thread.start()
             self._data.connection_test_running = True
@@ -204,67 +262,110 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
    
             
 
+    # --- Combined sensor thread (motion + runout on ONE MCP2221A session) ----
+    # The MCP2221A allows only one open HID session, so both pins must be read
+    # by a single thread. This thread is started at PRINT_STARTED and runs for
+    # the whole print; the plugin's flag state machine decides when motion is
+    # actually acted upon (via sensor_event_callback).
+    def sensor_thread_start(self):
+        try:
+            if (self.sensor_thread is None): self.sensor_thread = None
+        except: self.sensor_thread = None
 
-    # Starts the motion sensor if the sensors are enabled
+        motion_on = self.motion_sensor_enabled and (self.motion_sensor_pin >= 0)
+        runout_on = self.runout_sensor_enabled and (self.runout_sensor_pin >= 0)
+
+        if not motion_on and not runout_on:
+            return
+
+        if self.sensor_thread is None:
+            self.reset_distance()
+            self._data.last_motion_detected = time.time()
+            self.runout_paused = False
+            self.code_sent = False
+            self.trigger_custom_gcode = False
+            self.sensor_thread = CombinedSensorUSBThread(
+                1, "CombinedSensorThread", self._logger, self._data,
+                motion_pin=(self.motion_sensor_pin if motion_on else -1),
+                motion_callback=self.sensor_event_callback,
+                max_not_moving_time=1,
+                runout_pin=(self.runout_sensor_pin if runout_on else -1),
+                runout_callback=self.runout_event_callback,
+                runout_triggered_low=self.runout_triggered_low,
+                runout_debounce_seconds=self.runout_debounce)
+            self.sensor_thread.start()
+            self._logger.info(
+                "Combined sensor thread started (motion_on=%s pin G%s, runout_on=%s pin G%s)"
+                % (motion_on, self.motion_sensor_pin, runout_on, self.runout_sensor_pin))
+
+    def sensor_thread_stop(self):
+        try:
+            if (self.sensor_thread is None): self.sensor_thread = None
+        except: self.sensor_thread = None
+        if self.sensor_thread is not None:
+            self.sensor_thread.keepRunning = False
+            self.sensor_thread = None
+            self._logger.info("Combined sensor thread stopped")
+        self.runout_paused = False
+        if (self._data.flag > status_flags["OFF"]):
+            self._data.flag = status_flags["OFF"]
+
+    # Backwards-compatible shims used elsewhere in the lifecycle. Motion and
+    # runout now share one thread, so these all map onto it.
     def motion_sensor_start(self):
+        # Ensure the combined thread is running (arming of motion is handled by
+        # the flag state machine, not by (re)starting the thread).
+        self.sensor_thread_start()
+
+    def motion_sensor_stop_thread(self):
+        self.sensor_thread_stop()
+
+    def runout_sensor_start(self):
+        self.sensor_thread_start()
+
+    def runout_sensor_stop_thread(self):
+        self.sensor_thread_stop()
+
+    # --- old single-pin lifecycle (removed; kept name map above) -------------
+    def _legacy_unused(self):
         self._logger.debug("Sensor enabled: " + str(self.motion_sensor_enabled))
 
         try:
             if(self.motion_sensor_thread is None): self.motion_sensor_thread = None
         except: self.motion_sensor_thread  = None
+        return  # legacy body disabled; combined thread is used instead
 
-        if self.motion_sensor_enabled and (self.motion_sensor_pin>=0):
-           
-            self._logger.debug("GPIO mode: BCM Mode ONLY")
-            self._logger.debug("GPIO pin: " + str(self.motion_sensor_pin))
-            self.reset_distance()
-            self._data.last_motion_detected = time.time()
-            
-            self._logger.info("Motion sensor started. dist:" +str(self.motion_sensor_detection_distance) + " time:" + str(self._data.last_motion_detected))
-            self._logger.debug("Distance: " + str(self.motion_sensor_detection_distance))
-            
-            not_moving_return_seconds = 1
-            if self.motion_sensor_thread == None:
-                self._logger.debug("Max Timeout: " + str(self.motion_sensor_max_not_moving))
+    # Called by the runout thread: present=False -> filament ran out -> pause.
+    def runout_event_callback(self, present):
+        if present:
+            # Filament is back / present again; just clear our local flag.
+            self.runout_paused = False
+            return
 
-                
-                self.motion_sensor_thread = MotionSensorGPIOThread(1, "MotionSensorTimeoutDetectionThread", self.motion_sensor_pin,
-                    not_moving_return_seconds, self._logger, self._data, pCallback=self.sensor_event_callback)
-                # Start Timeout_Detection thread
-                self.motion_sensor_thread.start()
-                
+        # Filament ABSENT. Pause the print once, using the same pause path
+        # as the motion-jam logic.
+        if self.runout_paused:
+            return
+        self.runout_paused = True
+        self._logger.info("Filament runout detected by switch sensor. Pausing.")
+        if (_debug_in_terminal):
+            self._printer.commands("echo: [Fsensor] Filament runout (switch). Pausing.")
 
-            self.code_sent = False
-            self.trigger_custom_gcode = False
+        if (self.pause_command == ";"):
+            # Custom-GCode-only mode: send the custom GCode directly.
+            self.send_custom_gcode_afterpause()
         else:
-            self.motion_sensor_enabled = False
-            if self.motion_sensor_thread is not None:
-                self.motion_sensor_stop_thread()
-        
-    # Stop the motion_sensor thread
-    def motion_sensor_stop_thread(self):
-        try:
-            if(self.motion_sensor_thread is None): self.motion_sensor_thread = None
-        except: self.motion_sensor_thread  = None
-        
-        if(self.motion_sensor_thread is not None):
-            if (_debug_in_terminal): self._printer.commands("echo: [Fsensor] motion_sensor_stop_thread.")
-            self.motion_sensor_thread.keepRunning = False
-            self.motion_sensor_thread = None
-            self._logger.info("Motion sensor stopped")
-        
-        if (self._data.flag > status_flags["OFF"]):
-            
-            self._data.flag = status_flags["OFF"]
+            self._printer.commands(self.pause_command)
+            self.trigger_custom_gcode = True
 
 
 # Sensor callbacks - this is where the stopping conditions are coded.
 # It is called when: 1) when sensor senses movement. [IO interrupt event]  2) when extruder extrudes more than it should [hooked event]
     def sensor_event_callback (self, pMoving=False):
         if (self._data.flag<status_flags["PAUSED"]):
-            try:
-                self.motion_sensor_thread.keepRunning = False
-            except: pass
+            # Motion is not being acted upon yet (not armed / print not active).
+            # Do NOT stop the sensor thread here: it is shared with the runout
+            # switch, which must keep running. Just ignore motion for now.
             self._data.filament_moving = False
             return
         self._data.filament_moving = pMoving
@@ -282,11 +383,13 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
 
             # 10 seconds to timeout
             elif (self._data.flag>=status_flags["MONITORING"]) and (self.motion_sensor_max_not_moving>=20) and (self._data.flag!=status_flags["TIMEOUT_10S_LEFT"] or self._data.flag!=status_flags["TIMEOUT_10S_LEFT_DIST_REACHED"]) and ( self.motion_sensor_max_not_moving - calc_dur_no_move <=11) and (self._data.flag < status_flags["MAX_TIMEOUT_STOP_ASAP"]):
-                self._logger.info("10s to TIMEOUT, last state: " + str(self._data.flag))
                 if (_debug_in_terminal): self._printer.commands("echo: [Fsensor] 10s to max timeout")
                 if (self._data.flag==status_flags["DIST_REACHED_GRACE_PERIOD"]):
+                    self._logger.info("10s to TIMEOUT, last state: " + str(self._data.flag))
                     self._data.flag = status_flags["TIMEOUT_10S_LEFT_DIST_REACHED"]
-                elif (self._data.flag==status_flags["MONITORING"]): self._data.flag = status_flags["TIMEOUT_10S_LEFT"]
+                elif (self._data.flag==status_flags["MONITORING"]):
+                    self._logger.info("10s to TIMEOUT, last state: " + str(self._data.flag))
+                    self._data.flag = status_flags["TIMEOUT_10S_LEFT"]
 
 
             if(not self.code_sent) and ((self._data.flag == status_flags["DIST_REACHED_STOP_ASAP"]) or (self._data.flag == status_flags["MAX_TIMEOUT_STOP_ASAP"])):
@@ -418,13 +521,15 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
     # Remove motion sensor thread if the print is paused
     def main_thread_cleanup(self, pEvent=""):
         
-        if self.motion_sensor_enabled or (self.motion_sensor_thread is not None):
-            self._logger.info("%s: Motion sensor cleanup." % (pEvent))
+        if self.motion_sensor_enabled or self.runout_sensor_enabled or (self.sensor_thread is not None) or (self.motion_sensor_thread is not None):
+            self._logger.info("%s: Sensor cleanup." % (pEvent))
+            # Stop the connection-test thread if any (single-pin, short-lived).
             try:
                 self.motion_sensor_thread.keepRunning = False
             except: pass
-
-            self.motion_sensor_stop_thread()
+            self.motion_sensor_thread = None
+            # Stop the combined motion+runout thread.
+            self.sensor_thread_stop()
             self._data.filament_moving = False
     
 # Events
@@ -442,8 +547,12 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
                 self.print_start_time = time.time()
                 self.print_pause_time = 0
                 self.last_pause_t0 = -255
+            # Runout switch runs independently for the whole print.
+            self.runout_sensor_start()
         elif event is Events.PRINT_RESUMED:
             if (self._data.connection_test_running): self.stop_secondary_thread()
+            # Allow the runout switch to trigger again after a resume.
+            self.runout_paused = False
             if (self.motion_sensor_enabled) and (self.motion_sensor_pin>=0):
                 
                 # check T0 before resuming after a pause
@@ -462,6 +571,11 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
                 #if(self.detection_method == 1):
                 self.reset_remainin_distance()
                 self.trigger_custom_gcode = False
+            # (Re)start the combined sensor thread on resume so both the runout
+            # switch and motion detection are active again immediately, with
+            # the current settings. This also means settings changed while
+            # paused take effect right after Resume, without ending the print.
+            self.sensor_thread_start()
         
 
         # Start motion sensor on first G1 command
@@ -493,6 +607,9 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
                 self.updateToUi()
             self._data.flag = status_flags["OFF"]
             self.main_thread_cleanup(event)
+            # Stop runout monitor at print end regardless of motion settings.
+            self.runout_sensor_stop_thread()
+            self.runout_paused = False
 
         # Pause event detected
         elif (event is Events.PRINT_PAUSED) or (event is Events.FILAMENT_CHANGE):
@@ -536,6 +653,8 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
             self._logger.info("Printer disconnect or error. last state: " + str(self._data.flag))
             self._data.flag = status_flags["PRINTER_ERROR"]
             self.main_thread_cleanup(event)
+            self.runout_sensor_stop_thread()
+            self.runout_paused = False
             
 
     def send_custom_gcode_afterpause(self):
@@ -615,13 +734,13 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
     def update_hook(self):
         return dict(
             filamentmotionsensor=dict(
-                displayName="Filament Motion Sensor",
+                displayName="Filament Motion Sensor USB (MCP2221A)",
                 displayVersion=self._plugin_version,
 
                 # version check: github repository
                 type="github_release",
-                user="tabahi",
-                repo="Octoprint-Filament-Motion-Sensor ",
+                user="devouted",
+                repo="Octoprint-Filament-Motion-Sensor",
                 current=self._plugin_version,
 
                 # stable releases
@@ -641,7 +760,7 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
 				],
 
                 # update method: pip
-                pip="https://github.com/tabahi/Octoprint-Filament-Motion-Sensor/archive/{target_version}.zip"
+                pip="https://github.com/devouted/Octoprint-Filament-Motion-Sensor/archive/{target_version}.zip"
             )
         )
 
@@ -733,9 +852,9 @@ class FilamentMotionSensor(octoprint.plugin.StartupPlugin,
         return parsed_temps
 
 
-__plugin_name__ = "Filament Motion Sensor"
+__plugin_name__ = "Filament Motion Sensor USB (MCP2221A)"
 __plugin_version__ = "2.1"
-__plugin_pythoncompat__ = ">=2.7,<4"
+__plugin_pythoncompat__ = ">=3.7,<4"
 
 def __plugin_load__():
     global __plugin_implementation__
@@ -751,15 +870,21 @@ def __plugin_load__():
 
 
 def __plugin_check__():
+    # Require Adafruit Blinka (board/digitalio) to be importable, and an
+    # MCP2221A reachable over USB. Importing `board` can raise more than just
+    # ImportError: Blinka raises RuntimeError ("no MCP2221 device found") when
+    # the adapter is not plugged in. Catch everything so a missing/unplugged
+    # adapter disables the plugin gracefully instead of crashing plugin load.
     try:
-        import gpiod
-    except ImportError:
+        import board  # noqa: F401
+        import digitalio  # noqa: F401
+    except Exception:
         return False
 
     try:
-        if (plugin_check_rpi_gpio()==False): return False
-    except:
+        if (plugin_check_mcp2221() == False):
+            return False
+    except Exception:
         return False
-
 
     return True
